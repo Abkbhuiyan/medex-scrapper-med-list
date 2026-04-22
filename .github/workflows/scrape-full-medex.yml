@@ -3,6 +3,10 @@ name: Scrape MedEx Full Catalog
 on:
   workflow_dispatch:
     inputs:
+      total_pages:
+        description: "How many MedEx list pages to include in this run"
+        required: true
+        default: "839"
       batch_size:
         description: "How many MedEx list pages per job"
         required: true
@@ -23,23 +27,36 @@ jobs:
       total_batches: ${{ steps.make-matrix.outputs.total_batches }}
 
     steps:
-      - name: Build batch matrix for all 839 pages
+      - name: Build batch matrix
         id: make-matrix
         shell: python
         env:
-          TOTAL_PAGES: "839"
-          BATCH_SIZE: ${{ github.event.inputs.batch_size }}
+          TOTAL_PAGES: ${{ inputs.total_pages }}
+          BATCH_SIZE: ${{ inputs.batch_size }}
         run: |
           import json
+          import math
           import os
+          import sys
 
           total_pages = int(os.environ["TOTAL_PAGES"])
           batch_size = int(os.environ["BATCH_SIZE"])
+
+          if total_pages < 1:
+              raise ValueError("total_pages must be >= 1")
+          if batch_size < 1:
+              raise ValueError("batch_size must be >= 1")
 
           batches = []
           for start in range(1, total_pages + 1, batch_size):
               end = min(start + batch_size - 1, total_pages)
               batches.append({"start": start, "end": end})
+
+          if len(batches) > 256:
+              raise ValueError(
+                  f"Matrix would create {len(batches)} jobs, which exceeds GitHub's 256-job matrix limit. "
+                  f"Increase batch_size or reduce total_pages."
+              )
 
           matrix = {"batch": batches}
 
@@ -57,7 +74,7 @@ jobs:
 
     strategy:
       fail-fast: false
-      max-parallel: ${{ fromJSON(github.event.inputs.max_parallel) }}
+      max-parallel: ${{ fromJSON(inputs.max_parallel) }}
       matrix: ${{ fromJSON(needs.plan-batches.outputs.matrix) }}
 
     env:
@@ -89,11 +106,10 @@ jobs:
             --end-page "${{ matrix.batch.end }}"
 
       - name: Show output files
-        run: |
-          ls -lah output || true
+        run: ls -lah output || true
 
       - name: Upload Excel artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         with:
           name: medex-output-${{ matrix.batch.start }}-${{ matrix.batch.end }}
           path: output/*.xlsx
