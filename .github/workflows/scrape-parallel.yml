@@ -1,0 +1,43 @@
+name: Scrape MedEx Parallel
+
+on:
+  workflow_dispatch:
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        batch:
+          - { start: 1, end: 30 }
+          - { start: 31, end: 60 }
+          - { start: 61, end: 90 }
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scraper
+        run: |
+          python scrape_medex.py \
+            --start-page "${{ matrix.batch.start }}" \
+            --end-page "${{ matrix.batch.end }}"
+
+      - name: Upload Excel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: medex-output-${{ matrix.batch.start }}-${{ matrix.batch.end }}
+          path: output/*.xlsx
+          retention-days: 7

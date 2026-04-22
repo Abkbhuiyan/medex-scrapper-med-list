@@ -1,0 +1,47 @@
+name: Scrape MedEx Manual
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_page:
+        description: "Start page number"
+        required: true
+        default: "1"
+      end_page:
+        description: "End page number"
+        required: true
+        default: "30"
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scraper
+        run: |
+          python scrape_medex.py \
+            --start-page "${{ github.event.inputs.start_page }}" \
+            --end-page "${{ github.event.inputs.end_page }}"
+
+      - name: Show output files
+        run: ls -lah output
+
+      - name: Upload Excel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: medex-output-${{ github.event.inputs.start_page }}-${{ github.event.inputs.end_page }}
+          path: output/*.xlsx
+          retention-days: 7
