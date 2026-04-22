@@ -2,14 +2,17 @@ import argparse
 import os
 import re
 import time
+from collections import deque
 from urllib.parse import urljoin
 
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
+from openpyxl.styles import Alignment, Font, PatternFill
 
 BASE_LIST_URL = "https://medex.com.bd/brands?page={}"
 BASE_SITE = "https://medex.com.bd"
+
 TEMPLATE_COLUMNS = [
     "name",
     "category",
@@ -48,7 +51,7 @@ def safe_get(url, retries=3, sleep_sec=1.5, timeout=30):
 
 
 def clean_text(text):
-    if not text:
+    if text is None:
         return ""
     return re.sub(r"\s+", " ", str(text)).strip()
 
@@ -58,6 +61,7 @@ def normalize_strength(text):
         return ""
 
     text = clean_text(text)
+
     patterns = [
         r"\d+(?:\.\d+)?\s*(?:mg|mcg|µg|g|kg|ml|l|IU|%|units?)\s*/\s*\d+(?:\.\d+)?\s*(?:ml|l|g)",
         r"\d+(?:\.\d+)?\s*(?:mg|mcg|µg|g|kg|ml|l|IU|%|units?)",
@@ -96,6 +100,7 @@ def parse_brand_list_page(html):
         if link not in seen:
             seen.add(link)
             unique_links.append(link)
+
     return unique_links
 
 
@@ -113,6 +118,7 @@ def extract_strip_price(soup):
 
 def parse_available_as_variants(soup, base_brand_name):
     variants = []
+
     text_nodes = soup.find_all(string=lambda value: value and "Also available as" in value)
     if not text_nodes:
         return variants
@@ -123,7 +129,7 @@ def parse_available_as_variants(soup, base_brand_name):
     next_element = parent.find_next()
     scan_limit = 0
 
-    while next_element and scan_limit < 20:
+    while next_element and scan_limit < 30:
         scan_limit += 1
 
         if hasattr(next_element, "name") and next_element.name in ["h2", "h3", "h4"]:
@@ -169,6 +175,7 @@ def parse_available_as_variants(soup, base_brand_name):
         if key not in seen:
             seen.add(key)
             deduped.append(variant)
+
     return deduped
 
 
@@ -218,6 +225,7 @@ def normalize_dosage_form(value):
 
 def infer_unit(dosage_form, unit_price, strip_price):
     dosage = clean_text(dosage_form).lower()
+
     if any(token in dosage for token in ["tablet", "capsule", "caplet", "suppository"]):
         return "pcs" if unit_price else ("strip" if strip_price else "pcs")
     if "sachet" in dosage:
@@ -232,6 +240,7 @@ def infer_unit(dosage_form, unit_price, strip_price):
         return "vial"
     if "powder" in dosage:
         return "pack"
+
     return ""
 
 
@@ -280,6 +289,7 @@ def parse_product_page(html, url):
 
     data["unit_price"] = extract_unit_price(soup)
     data["strip_price"] = extract_strip_price(soup)
+
     dosage_form = normalize_dosage_form(detect_dosage_form(soup, dosage_from_title))
 
     if base_brand and strength:
@@ -297,6 +307,7 @@ def parse_product_page(html, url):
     variants = parse_available_as_variants(soup, base_brand)
     data["has_available_as"] = len(variants) > 0
     data["available_as_count"] = len(variants)
+
     return data, variants
 
 
@@ -305,6 +316,7 @@ def map_to_pos_row(row):
     unit_price = row.get("unit_price", "")
     strip_price = row.get("strip_price", "")
     sales_price = select_sales_price(unit_price, strip_price)
+
     return {
         "name": clean_text(row.get("product_name", "")),
         "category": "",
@@ -319,12 +331,53 @@ def map_to_pos_row(row):
     }
 
 
+def crawl_product_cluster(seed_url, sleep_between_requests=0.7):
+    """
+    Crawl one product page and recursively follow its 'Also available as' variants.
+    This avoids missing nested variant chains.
+    """
+    cluster_rows = []
+    queue = deque([seed_url])
+    visited_urls = set()
+
+    while queue:
+        current_url = queue.popleft()
+        if current_url in visited_urls:
+            continue
+
+        visited_urls.add(current_url)
+        response = safe_get(current_url)
+        if not response:
+            print(f"      [SKIP] Could not fetch product page {current_url}")
+            continue
+
+        try:
+            product_data, variants = parse_product_page(response.text, current_url)
+            product_data["source_type"] = "main_page" if current_url == seed_url else "variant_page"
+            cluster_rows.append(product_data)
+
+            if variants:
+                print(f"      Found {len(variants)} variants in 'Also available as' for {current_url}")
+
+            for variant in variants:
+                variant_url = variant["variant_url"]
+
+                if variant_url not in visited_urls:
+                    queue.append(variant_url)
+
+        except Exception as exc:
+            print(f"      [WARN] Error parsing product page {current_url}: {exc}")
+
+        time.sleep(sleep_between_requests)
+
+    return cluster_rows
+
+
 def scrape_medex_pages(start_page, end_page, sleep_between_products=0.7, sleep_between_pages=1.5):
     print(f"Scraping brand pages {start_page} to {end_page}")
 
     all_rows = []
-    seen_product_urls = set()
-    seen_variant_urls = set()
+    globally_seen_urls = set()
 
     for page in range(start_page, end_page + 1):
         list_url = BASE_LIST_URL.format(page)
@@ -339,79 +392,21 @@ def scrape_medex_pages(start_page, end_page, sleep_between_products=0.7, sleep_b
         print(f"  Found {len(brand_links)} brand links")
 
         for index, brand_url in enumerate(brand_links, start=1):
-            if brand_url in seen_product_urls:
+            if brand_url in globally_seen_urls:
                 continue
 
             print(f"    [{index}/{len(brand_links)}] Product: {brand_url}")
-            seen_product_urls.add(brand_url)
 
-            product_response = safe_get(brand_url)
-            if not product_response:
-                print("      [SKIP] Could not fetch product page")
-                continue
+            cluster_rows = crawl_product_cluster(
+                seed_url=brand_url,
+                sleep_between_requests=sleep_between_products,
+            )
 
-            try:
-                product_data, variants = parse_product_page(product_response.text, brand_url)
-                product_data["source_type"] = "main_page"
-                all_rows.append(product_data)
-
-                if variants:
-                    print(f"      Found {len(variants)} variants in 'Also available as'")
-
-                for variant in variants:
-                    variant_url = variant["variant_url"]
-                    if variant_url in seen_variant_urls or variant_url in seen_product_urls:
-                        continue
-
-                    seen_variant_urls.add(variant_url)
-                    variant_response = safe_get(variant_url)
-
-                    if not variant_response:
-                        all_rows.append(
-                            {
-                                "product_name": variant["variant_name"],
-                                "base_brand": product_data["base_brand"],
-                                "generic_name": product_data["generic_name"],
-                                "strength": variant["variant_strength"],
-                                "dosage_form": normalize_dosage_form(variant["variant_dosage"]),
-                                "manufacturer": product_data["manufacturer"],
-                                "unit_price": "",
-                                "strip_price": "",
-                                "brand_url": variant_url,
-                                "has_available_as": False,
-                                "available_as_count": 0,
-                                "source_type": "variant_from_available_as_fallback",
-                            }
-                        )
-                        continue
-
-                    try:
-                        variant_data, _ = parse_product_page(variant_response.text, variant_url)
-                        variant_data["source_type"] = "variant_page"
-                        all_rows.append(variant_data)
-                    except Exception as exc:
-                        print(f"      [WARN] Error parsing variant page {variant_url}: {exc}")
-                        all_rows.append(
-                            {
-                                "product_name": variant["variant_name"],
-                                "base_brand": product_data["base_brand"],
-                                "generic_name": product_data["generic_name"],
-                                "strength": variant["variant_strength"],
-                                "dosage_form": normalize_dosage_form(variant["variant_dosage"]),
-                                "manufacturer": product_data["manufacturer"],
-                                "unit_price": "",
-                                "strip_price": "",
-                                "brand_url": variant_url,
-                                "has_available_as": False,
-                                "available_as_count": 0,
-                                "source_type": "variant_from_available_as_fallback",
-                            }
-                        )
-
-                time.sleep(sleep_between_products)
-
-            except Exception as exc:
-                print(f"      [WARN] Error parsing product page {brand_url}: {exc}")
+            for row in cluster_rows:
+                brand_row_url = row.get("brand_url", "")
+                if brand_row_url and brand_row_url not in globally_seen_urls:
+                    globally_seen_urls.add(brand_row_url)
+                    all_rows.append(row)
 
         time.sleep(sleep_between_pages)
 
@@ -419,8 +414,13 @@ def scrape_medex_pages(start_page, end_page, sleep_between_products=0.7, sleep_b
 
     if not dataframe.empty:
         before = len(dataframe)
+
         dataframe = dataframe.drop_duplicates(subset=["brand_url"], keep="first")
-        dataframe = dataframe.drop_duplicates(subset=["product_name", "manufacturer", "dosage_form"], keep="first")
+        dataframe = dataframe.drop_duplicates(
+            subset=["product_name", "manufacturer", "dosage_form"],
+            keep="first",
+        )
+
         after = len(dataframe)
         print(f"\nDuplicates removed: {before - after}")
         dataframe = dataframe.reset_index(drop=True)
@@ -428,8 +428,28 @@ def scrape_medex_pages(start_page, end_page, sleep_between_products=0.7, sleep_b
     return dataframe
 
 
+def autosize_worksheet_columns(worksheet, min_width=12, max_width=40):
+    for column_cells in worksheet.columns:
+        values = [clean_text(cell.value) for cell in column_cells if cell.value is not None]
+        max_length = max((len(value) for value in values), default=0)
+        adjusted_width = min(max(max_length + 2, min_width), max_width)
+        worksheet.column_dimensions[column_cells[0].column_letter].width = adjusted_width
+
+
+def style_header_row(worksheet):
+    header_font = Font(bold=True, color="000000")
+    header_fill = PatternFill(fill_type="solid", fgColor="D9EAF7")
+    header_alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    for cell in worksheet[1]:
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = header_alignment
+
+
 def build_output_workbook(raw_dataframe, output_path):
     pos_dataframe = pd.DataFrame([map_to_pos_row(row) for row in raw_dataframe.to_dict("records")])
+
     if pos_dataframe.empty:
         pos_dataframe = pd.DataFrame(columns=TEMPLATE_COLUMNS)
     else:
@@ -438,9 +458,18 @@ def build_output_workbook(raw_dataframe, output_path):
     summary_rows = [
         ["total raw rows", len(raw_dataframe)],
         ["total pos rows", len(pos_dataframe)],
-        ["rows with sales price", int(pos_dataframe["sales price"].astype(str).str.strip().ne("").sum()) if not pos_dataframe.empty else 0],
-        ["rows without sales price", int(pos_dataframe["sales price"].astype(str).str.strip().eq("").sum()) if not pos_dataframe.empty else 0],
-        ["rows with dosage", int(pos_dataframe["Dosage"].astype(str).str.strip().ne("").sum()) if not pos_dataframe.empty else 0],
+        [
+            "rows with sales price",
+            int(pos_dataframe["sales price"].astype(str).str.strip().ne("").sum()) if not pos_dataframe.empty else 0,
+        ],
+        [
+            "rows without sales price",
+            int(pos_dataframe["sales price"].astype(str).str.strip().eq("").sum()) if not pos_dataframe.empty else 0,
+        ],
+        [
+            "rows with dosage",
+            int(pos_dataframe["Dosage"].astype(str).str.strip().ne("").sum()) if not pos_dataframe.empty else 0,
+        ],
     ]
     summary_dataframe = pd.DataFrame(summary_rows, columns=["metric", "value"])
 
@@ -449,16 +478,11 @@ def build_output_workbook(raw_dataframe, output_path):
         raw_dataframe.to_excel(writer, index=False, sheet_name="MedEx_Raw")
         summary_dataframe.to_excel(writer, index=False, sheet_name="Summary")
 
-        workbook = writer.book
         for sheet_name in ["Sheet1", "MedEx_Raw", "Summary"]:
             worksheet = writer.sheets[sheet_name]
             worksheet.freeze_panes = "A2"
-            for column_cells in worksheet.columns:
-                values = [clean_text(cell.value) for cell in column_cells if cell.value is not None]
-                max_length = max((len(value) for value in values), default=0)
-                worksheet.column_dimensions[column_cells[0].column_letter].width = min(max(max_length + 2, 12), 36)
-            for cell in worksheet[1]:
-                cell.font = workbook._fonts[1] if len(workbook._fonts) > 1 else cell.font
+            autosize_worksheet_columns(worksheet)
+            style_header_row(worksheet)
 
 
 def main():
@@ -477,6 +501,7 @@ def main():
 
     file_name = f"medex_pos_mapped_pages_{args.start_page}_to_{args.end_page}.xlsx"
     output_path = os.path.join(output_dir, file_name)
+
     build_output_workbook(dataframe, output_path)
 
     print(f"\nSaved Excel file: {output_path}")
