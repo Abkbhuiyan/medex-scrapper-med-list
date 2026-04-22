@@ -10,6 +10,18 @@ from bs4 import BeautifulSoup
 
 BASE_LIST_URL = "https://medex.com.bd/brands?page={}"
 BASE_SITE = "https://medex.com.bd"
+TEMPLATE_COLUMNS = [
+    "name",
+    "category",
+    "cost price",
+    "sales price",
+    "unit",
+    "generic name",
+    "manufacturer",
+    "Dosage",
+    "SKU",
+    "DAR number",
+]
 
 HEADERS = {
     "User-Agent": (
@@ -193,6 +205,44 @@ def detect_dosage_form(soup, fallback=""):
     return ""
 
 
+def normalize_dosage_form(value):
+    value = clean_text(value)
+    mapping = {
+        "Chew. Tablet": "Chewable Tablet",
+        "Cap.": "Capsule",
+        "Tab.": "Tablet",
+        "Inj.": "Injection",
+    }
+    return mapping.get(value, value)
+
+
+def infer_unit(dosage_form, unit_price, strip_price):
+    dosage = clean_text(dosage_form).lower()
+    if any(token in dosage for token in ["tablet", "capsule", "caplet", "suppository"]):
+        return "pcs" if unit_price else ("strip" if strip_price else "pcs")
+    if "sachet" in dosage:
+        return "sachet"
+    if any(token in dosage for token in ["syrup", "suspension", "solution", "drops", "lotion", "spray"]):
+        return "bottle"
+    if any(token in dosage for token in ["cream", "ointment", "gel"]):
+        return "tube"
+    if "inhaler" in dosage:
+        return "inhaler"
+    if "injection" in dosage:
+        return "vial"
+    if "powder" in dosage:
+        return "pack"
+    return ""
+
+
+def select_sales_price(unit_price, strip_price):
+    if unit_price not in [None, ""]:
+        return unit_price
+    if strip_price not in [None, ""]:
+        return strip_price
+    return ""
+
+
 def parse_product_page(html, url):
     soup = BeautifulSoup(html, "lxml")
 
@@ -230,7 +280,7 @@ def parse_product_page(html, url):
 
     data["unit_price"] = extract_unit_price(soup)
     data["strip_price"] = extract_strip_price(soup)
-    dosage_form = detect_dosage_form(soup, dosage_from_title)
+    dosage_form = normalize_dosage_form(detect_dosage_form(soup, dosage_from_title))
 
     if base_brand and strength:
         product_name = clean_text(f"{base_brand} {strength}")
@@ -248,6 +298,25 @@ def parse_product_page(html, url):
     data["has_available_as"] = len(variants) > 0
     data["available_as_count"] = len(variants)
     return data, variants
+
+
+def map_to_pos_row(row):
+    dosage = normalize_dosage_form(row.get("dosage_form", ""))
+    unit_price = row.get("unit_price", "")
+    strip_price = row.get("strip_price", "")
+    sales_price = select_sales_price(unit_price, strip_price)
+    return {
+        "name": clean_text(row.get("product_name", "")),
+        "category": "",
+        "cost price": "",
+        "sales price": sales_price,
+        "unit": infer_unit(dosage, unit_price, strip_price),
+        "generic name": clean_text(row.get("generic_name", "")),
+        "manufacturer": clean_text(row.get("manufacturer", "")),
+        "Dosage": dosage,
+        "SKU": "",
+        "DAR number": "",
+    }
 
 
 def scrape_medex_pages(start_page, end_page, sleep_between_products=0.7, sleep_between_pages=1.5):
@@ -304,7 +373,7 @@ def scrape_medex_pages(start_page, end_page, sleep_between_products=0.7, sleep_b
                                 "base_brand": product_data["base_brand"],
                                 "generic_name": product_data["generic_name"],
                                 "strength": variant["variant_strength"],
-                                "dosage_form": variant["variant_dosage"],
+                                "dosage_form": normalize_dosage_form(variant["variant_dosage"]),
                                 "manufacturer": product_data["manufacturer"],
                                 "unit_price": "",
                                 "strip_price": "",
@@ -328,7 +397,7 @@ def scrape_medex_pages(start_page, end_page, sleep_between_products=0.7, sleep_b
                                 "base_brand": product_data["base_brand"],
                                 "generic_name": product_data["generic_name"],
                                 "strength": variant["variant_strength"],
-                                "dosage_form": variant["variant_dosage"],
+                                "dosage_form": normalize_dosage_form(variant["variant_dosage"]),
                                 "manufacturer": product_data["manufacturer"],
                                 "unit_price": "",
                                 "strip_price": "",
@@ -359,6 +428,39 @@ def scrape_medex_pages(start_page, end_page, sleep_between_products=0.7, sleep_b
     return dataframe
 
 
+def build_output_workbook(raw_dataframe, output_path):
+    pos_dataframe = pd.DataFrame([map_to_pos_row(row) for row in raw_dataframe.to_dict("records")])
+    if pos_dataframe.empty:
+        pos_dataframe = pd.DataFrame(columns=TEMPLATE_COLUMNS)
+    else:
+        pos_dataframe = pos_dataframe[TEMPLATE_COLUMNS].drop_duplicates().reset_index(drop=True)
+
+    summary_rows = [
+        ["total raw rows", len(raw_dataframe)],
+        ["total pos rows", len(pos_dataframe)],
+        ["rows with sales price", int(pos_dataframe["sales price"].astype(str).str.strip().ne("").sum()) if not pos_dataframe.empty else 0],
+        ["rows without sales price", int(pos_dataframe["sales price"].astype(str).str.strip().eq("").sum()) if not pos_dataframe.empty else 0],
+        ["rows with dosage", int(pos_dataframe["Dosage"].astype(str).str.strip().ne("").sum()) if not pos_dataframe.empty else 0],
+    ]
+    summary_dataframe = pd.DataFrame(summary_rows, columns=["metric", "value"])
+
+    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+        pos_dataframe.to_excel(writer, index=False, sheet_name="Sheet1")
+        raw_dataframe.to_excel(writer, index=False, sheet_name="MedEx_Raw")
+        summary_dataframe.to_excel(writer, index=False, sheet_name="Summary")
+
+        workbook = writer.book
+        for sheet_name in ["Sheet1", "MedEx_Raw", "Summary"]:
+            worksheet = writer.sheets[sheet_name]
+            worksheet.freeze_panes = "A2"
+            for column_cells in worksheet.columns:
+                values = [clean_text(cell.value) for cell in column_cells if cell.value is not None]
+                max_length = max((len(value) for value in values), default=0)
+                worksheet.column_dimensions[column_cells[0].column_letter].width = min(max(max_length + 2, 12), 36)
+            for cell in worksheet[1]:
+                cell.font = workbook._fonts[1] if len(workbook._fonts) > 1 else cell.font
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--start-page", type=int, required=True)
@@ -373,14 +475,12 @@ def main():
     output_dir = "output"
     os.makedirs(output_dir, exist_ok=True)
 
-    file_name = f"medex_brands_pages_{args.start_page}_to_{args.end_page}.xlsx"
+    file_name = f"medex_pos_mapped_pages_{args.start_page}_to_{args.end_page}.xlsx"
     output_path = os.path.join(output_dir, file_name)
-
-    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-        dataframe.to_excel(writer, index=False, sheet_name="Medicines")
+    build_output_workbook(dataframe, output_path)
 
     print(f"\nSaved Excel file: {output_path}")
-    print(f"Total rows: {len(dataframe)}")
+    print(f"Total raw rows: {len(dataframe)}")
 
 
 if __name__ == "__main__":
