@@ -1,10 +1,11 @@
 import argparse
+import json
 import os
 import random
 import re
 import time
 from collections import deque
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse, urlunparse
 
 import pandas as pd
 import requests
@@ -68,11 +69,43 @@ session = requests.Session()
 session.headers.update(HEADERS)
 
 
+def load_cookies_from_env_or_file():
+    """Load MedEx cookies so requests can pass the site security check."""
+    cookie_header = os.getenv("MEDEX_COOKIE", "").strip()
+    if cookie_header:
+        for part in cookie_header.split(";"):
+            if "=" not in part:
+                continue
+            name, value = part.split("=", 1)
+            session.cookies.set(name.strip(), value.strip(), domain="medex.com.bd")
+        print("[INFO] Loaded cookies from MEDEX_COOKIE")
+        return
+
+    cookie_file = os.getenv("MEDEX_COOKIE_FILE", "medex_cookies.json").strip()
+    if cookie_file and os.path.exists(cookie_file):
+        with open(cookie_file, encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict):
+            for name, value in data.items():
+                session.cookies.set(str(name), str(value), domain="medex.com.bd")
+            print(f"[INFO] Loaded cookies from {cookie_file}")
+
+
+def is_security_challenge(response: requests.Response) -> bool:
+    if response is None:
+        return False
+    if "captcha-challenge" in (response.url or ""):
+        return True
+    text_head = response.text[:4000].lower() if response.text else ""
+    return "security check" in text_head and ("captcha" in text_head or "turnstile" in text_head or "unusual traffic" in text_head)
+
+
 def safe_get(url: str, retries=None, sleep_sec=None, timeout=None):
     retries = get_env_int("MAX_RETRIES", 5) if retries is None else retries
     sleep_sec = get_env_float("INITIAL_BACKOFF_SECONDS", 2.0) if sleep_sec is None else sleep_sec
     timeout = get_env_int("REQUEST_TIMEOUT_SECONDS", 30) if timeout is None else timeout
     jitter = get_env_float("RANDOM_JITTER_SECONDS", 0.8)
+    challenge_wait = get_env_float("SECURITY_CHALLENGE_WAIT_SECONDS", 180.0)
 
     retryable_statuses = {403, 429, 500, 502, 503, 504}
 
@@ -81,6 +114,15 @@ def safe_get(url: str, retries=None, sleep_sec=None, timeout=None):
             response = session.get(url, timeout=timeout)
 
             if response.status_code == 200:
+                if is_security_challenge(response):
+                    wait_time = challenge_wait + random.uniform(0, jitter)
+                    print(
+                        f"[WARN] Security check intercepted {url} "
+                        f"(attempt {attempt}/{retries}) -> sleeping {wait_time:.2f}s. "
+                        f"Refresh medex_cookies.json in the browser if this keeps happening."
+                    )
+                    time.sleep(wait_time)
+                    continue
                 return response
 
             if response.status_code in retryable_statuses:
@@ -113,6 +155,16 @@ def clean_text(text):
     if text is None:
         return ""
     return re.sub(r"\s+", " ", str(text)).strip()
+
+
+def canonicalize_brand_url(url: str) -> str:
+    """Normalize brand URLs so language suffixes and query params do not create duplicates."""
+    if not url:
+        return ""
+
+    parsed = urlparse(urljoin(BASE_SITE, url))
+    path = re.sub(r"/(bn|en)/?$", "", parsed.path)
+    return urlunparse((parsed.scheme, parsed.netloc, path, "", "", ""))
 
 
 def normalize_strength(text: str) -> str:
@@ -149,15 +201,26 @@ def parse_brand_list_page(html: str):
     soup = BeautifulSoup(html, "lxml")
     links = []
 
-    for anchor in soup.find_all("a", class_="hoverable-block"):
+    # MedEx currently uses a.brand-card; older pages used a.hoverable-block.
+    anchors = soup.find_all("a", class_="brand-card")
+    if not anchors:
+        anchors = soup.find_all("a", class_="hoverable-block")
+
+    for anchor in anchors:
         href = anchor.get("href", "")
         if href and "/brands/" in href:
-            links.append(urljoin(BASE_SITE, href))
+            links.append(canonicalize_brand_url(href))
+
+    if not links:
+        for anchor in soup.find_all("a", href=True):
+            href = anchor.get("href", "")
+            if re.search(r"/brands/\d+/", href):
+                links.append(canonicalize_brand_url(href))
 
     seen = set()
     unique_links = []
     for link in links:
-        if link not in seen:
+        if link and link not in seen:
             seen.add(link)
             unique_links.append(link)
 
@@ -166,13 +229,21 @@ def parse_brand_list_page(html: str):
 
 def extract_unit_price(soup: BeautifulSoup) -> str:
     text = soup.get_text("\n", strip=True)
-    match = re.search(r"Unit\s*Price:\s*৳\s*([\d,]+(?:\.\d+)?)", text, flags=re.IGNORECASE)
+    match = re.search(
+        r"Unit\s*Price:\s*(?:\n\s*)?৳\s*([\d,]+(?:\.\d+)?)",
+        text,
+        flags=re.IGNORECASE,
+    )
     return match.group(1).replace(",", "") if match else ""
 
 
 def extract_strip_price(soup: BeautifulSoup) -> str:
     text = soup.get_text("\n", strip=True)
-    match = re.search(r"Strip\s*Price:\s*৳\s*([\d,]+(?:\.\d+)?)", text, flags=re.IGNORECASE)
+    match = re.search(
+        r"Strip\s*Price:\s*(?:\n\s*)?৳\s*([\d,]+(?:\.\d+)?)",
+        text,
+        flags=re.IGNORECASE,
+    )
     return match.group(1).replace(",", "") if match else ""
 
 
@@ -210,7 +281,10 @@ def parse_available_as_variants(soup: BeautifulSoup, base_brand_name: str):
         if not href or "/brands/" not in href or not text:
             continue
 
-        full_url = urljoin(BASE_SITE, href)
+        full_url = canonicalize_brand_url(href)
+        if not full_url:
+            continue
+
         strength = normalize_strength(text)
 
         dosage = ""
@@ -338,7 +412,10 @@ def parse_product_page(html: str, url: str):
     heading_text = clean_text(h1.get_text(" ", strip=True)) if h1 else ""
 
     base_brand = brand_from_title.strip() if brand_from_title else heading_text
-    strength = normalize_strength(strength_from_title)
+    if strength_from_title and "+" in strength_from_title:
+        strength = clean_text(strength_from_title)
+    else:
+        strength = normalize_strength(strength_from_title)
 
     generic_link = soup.find("a", href=lambda value: value and "/generics/" in value)
     if generic_link:
@@ -399,14 +476,17 @@ def crawl_product_cluster(seed_url: str, sleep_between_requests=None):
         else sleep_between_requests
     )
     jitter = get_env_float("RANDOM_JITTER_SECONDS", 0.8)
+    # Full-catalog runs already visit every brand list page, so variant hops are optional.
+    follow_variants = os.getenv("FOLLOW_VARIANTS", "0").strip() not in {"0", "false", "False"}
 
     cluster_rows = []
+    seed_url = canonicalize_brand_url(seed_url)
     queue = deque([seed_url])
     visited_urls = set()
 
     while queue:
-        current_url = queue.popleft()
-        if current_url in visited_urls:
+        current_url = canonicalize_brand_url(queue.popleft())
+        if not current_url or current_url in visited_urls:
             continue
 
         visited_urls.add(current_url)
@@ -417,16 +497,16 @@ def crawl_product_cluster(seed_url: str, sleep_between_requests=None):
 
         try:
             product_data, variants = parse_product_page(response.text, current_url)
+            product_data["brand_url"] = canonicalize_brand_url(product_data.get("brand_url", current_url))
             product_data["source_type"] = "main_page" if current_url == seed_url else "variant_page"
             cluster_rows.append(product_data)
 
-            if variants:
+            if follow_variants and variants:
                 print(f"      Found {len(variants)} variants in 'Also available as' for {current_url}")
-
-            for variant in variants:
-                variant_url = variant["variant_url"]
-                if variant_url not in visited_urls:
-                    queue.append(variant_url)
+                for variant in variants:
+                    variant_url = canonicalize_brand_url(variant["variant_url"])
+                    if variant_url and variant_url not in visited_urls:
+                        queue.append(variant_url)
 
         except Exception as exc:
             print(f"      [WARN] Error parsing product page {current_url}: {exc}")
@@ -577,6 +657,8 @@ def main():
 
     if args.start_page > args.end_page:
         raise ValueError("start-page cannot be greater than end-page")
+
+    load_cookies_from_env_or_file()
 
     dataframe = scrape_medex_pages(
         start_page=args.start_page,

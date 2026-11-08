@@ -7,3 +7,5 @@ __pycache__/
 *.csv
 .env
 output/
+medex_cookies.json
+logs/
