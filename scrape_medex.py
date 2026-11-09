@@ -89,10 +89,21 @@ def parse_brand_list_page(html):
     soup = BeautifulSoup(html, "lxml")
     links = []
 
-    for anchor in soup.find_all("a", class_="hoverable-block"):
+    # MedEx currently uses a.brand-card; older pages used a.hoverable-block.
+    anchors = soup.find_all("a", class_="brand-card")
+    if not anchors:
+        anchors = soup.find_all("a", class_="hoverable-block")
+
+    for anchor in anchors:
         href = anchor.get("href", "")
         if href and "/brands/" in href:
             links.append(urljoin(BASE_SITE, href))
+
+    if not links:
+        for anchor in soup.find_all("a", href=True):
+            href = anchor.get("href", "")
+            if re.search(r"/brands/\d+/", href):
+                links.append(urljoin(BASE_SITE, href))
 
     seen = set()
     unique_links = []
@@ -106,13 +117,21 @@ def parse_brand_list_page(html):
 
 def extract_unit_price(soup):
     text = soup.get_text("\n", strip=True)
-    match = re.search(r"Unit\s*Price:\s*৳\s*([\d,]+(?:\.\d+)?)", text, flags=re.IGNORECASE)
+    match = re.search(
+        r"Unit\s*Price:\s*(?:\n\s*)?৳\s*([\d,]+(?:\.\d+)?)",
+        text,
+        flags=re.IGNORECASE,
+    )
     return match.group(1).replace(",", "") if match else ""
 
 
 def extract_strip_price(soup):
     text = soup.get_text("\n", strip=True)
-    match = re.search(r"Strip\s*Price:\s*৳\s*([\d,]+(?:\.\d+)?)", text, flags=re.IGNORECASE)
+    match = re.search(
+        r"Strip\s*Price:\s*(?:\n\s*)?৳\s*([\d,]+(?:\.\d+)?)",
+        text,
+        flags=re.IGNORECASE,
+    )
     return match.group(1).replace(",", "") if match else ""
 
 
